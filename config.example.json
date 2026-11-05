@@ -1,0 +1,21 @@
+{
+  "vault_root": "~/Library/Mobile Documents/iCloud~md~obsidian/Documents",
+  "git_dir": "~/.local/share/gitdirs/obsidian.git",
+  "state_dir": "~/Library/Application Support/ObsidianGuard",
+  "vaults": ["Notes"],
+  "backup_branch": "backup/local",
+  "remote": "origin",
+  "remote_url": "https://github.com/OWNER/PRIVATE-VAULT-REPO.git",
+  "github_repo": "OWNER/PRIVATE-VAULT-REPO",
+  "git": "/usr/bin/git",
+  "gh": "/opt/homebrew/bin/gh",
+  "push": false,
+  "notifications": true,
+  "snapshot_interval": 900,
+  "quiet_seconds": 30,
+  "deep_interval": 604800,
+  "mass_delete_limit": 10,
+  "minimum_free_bytes": 3221225472,
+  "exclude": [".DS_Store", "**/.DS_Store"],
+  "quiet_exclude": []
+}
