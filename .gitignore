@@ -18,6 +18,8 @@ run.lock
 lfs-cleanup.json
 runs*.jsonl
 snapshot-*/
+open-status.json
+*.app/
 *.log
 *.plist
 *-verification.json

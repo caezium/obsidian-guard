@@ -22,6 +22,7 @@ import sys
 import tempfile
 import textwrap
 import time
+from urllib.parse import quote
 
 DEFAULT_CONFIG = Path.home() / "Library/Application Support/ObsidianGuard/config.json"
 TEXT = {".md", ".json", ".canvas", ".base"}
@@ -113,6 +114,8 @@ def human_time(timestamp, now):
 
 
 def format_status(status, *, details=False, now=None):
+    if status.get("operation") == "open":
+        return "Obsidian Guard - checked launcher\n" + terminal_text(status["message"])
     if status.get("state") == "maintenance":
         cleanup = status["cleanup"]
         return ("Obsidian Guard - LFS temporary-file cleanup\n"
@@ -274,7 +277,8 @@ class Guard:
                 if not stat.S_ISREG(s.st_mode):
                     raise Blocked(f"Unexpected non-regular file: {rel}")
                 files[rel] = [s.st_size, s.st_mtime_ns]
-                if s.st_flags & getattr(stat, "SF_DATALESS", 0x40000000):
+                if (s.st_flags & getattr(stat, "SF_DATALESS", 0x40000000)
+                        or (name.startswith(".") and name.endswith(".icloud"))):
                     pending.append(rel)
         if pending:
             raise Blocked(f"{len(pending)} iCloud files are not downloaded; first: {pending[0]}")
@@ -322,6 +326,51 @@ class Guard:
             hashes.pop(rel, None)
         token = hashlib.sha256(json.dumps([files, anomalies], sort_keys=True).encode()).hexdigest()[:20]
         return changed, deleted, hashes, sorted(excluded), anomalies, problems, token
+
+    def vault_id(self, vault):
+        target = (self.root / vault).resolve()
+        registry = load(Path.home() / "Library/Application Support/obsidian/obsidian.json", {})
+        for key, item in registry.get("vaults", {}).items():
+            if item.get("path") and Path(item["path"]).resolve() == target:
+                return key
+        raise Blocked("This vault is not registered with Obsidian; register it after a successful check")
+
+    def open_vault(self, *, vault=None, deep=False, launch=True):
+        """Check before requesting a launch; never update backup state or history."""
+        started = time.perf_counter()
+        status = {"operation": "open", "checked_at": time.time()}
+        self.diagnostics = []
+        try:
+            vault = vault if vault is not None else self.c["vaults"][0]
+            if vault not in self.c["vaults"]:
+                raise Blocked("Choose a vault listed in the Guard configuration")
+            baseline = load(self.home / "baseline.json", {})
+            if not baseline.get("files") or not baseline.get("commit"):
+                raise Blocked("No trusted backup baseline exists yet; complete and review a backup first")
+            files = self.scan()
+            changed, deleted, _, _, anomalies, problems, _ = self.evaluate(files, baseline, deep)
+            missing = [p for p in deleted if not self.ignored(p) and not self.generated(p)]
+            if missing:
+                raise Blocked(f"{len(missing)} file(s) missing since the last snapshot; first: {missing[0]}. "
+                              "Let iCloud finish downloading, or let Guard back up intentional deletions before retrying")
+            if problems or anomalies:
+                raise Blocked((problems + anomalies)[0])
+            after = self.scan()
+            if any(files.get(p) != after.get(p) for p in set(files) | set(after)
+                   if not self.ignored(p) and not self.generated(p)):
+                raise Blocked("Files changed during the launch check; let edits or syncing settle and try again")
+            if launch:
+                uri = "obsidian://open?vault=" + quote(self.vault_id(vault), safe="")
+                self.command(["/usr/bin/open", uri], timeout=15, label="Open Obsidian")
+            status.update(state="opened" if launch else "ready", files=len(files), vault=vault,
+                          message="Checks passed; Obsidian was asked to open the vault" if launch else
+                                  "Launch checks passed; Obsidian was not opened")
+        except (Blocked, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            status.update(state="blocked", message="Obsidian was not opened. " + str(exc))
+        status.update(completed_at=time.time(), duration_seconds=round(time.perf_counter() - started, 3),
+                      diagnostics=self.diagnostics)
+        atomic_json(self.home / "open-status.json", status)
+        return status
 
     def snapshot(self, files, baseline, changed, deleted, exclusions):
         active_ref = self.git("symbolic-ref", "-q", "HEAD", check=False).decode().strip()
@@ -695,7 +744,7 @@ class Guard:
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "check", "status", "approve", "cleanup"])
+    parser.add_argument("command", choices=["run", "check", "status", "approve", "cleanup", "open"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("--now", action="store_true")
@@ -704,6 +753,8 @@ def main():
     parser.add_argument("--details", action="store_true", help="Include the snapshot commit and excluded file paths")
     parser.add_argument("--local-only", action="store_true", help="Save a local snapshot without uploading")
     parser.add_argument("--fingerprint")
+    parser.add_argument("--vault", help="Configured vault to open; defaults to the first configured vault")
+    parser.add_argument("--check-only", action="store_true", help="Validate the checked launcher without opening Obsidian")
     args = parser.parse_args()
     args.config = args.config.expanduser()
     if not args.config.is_file():
@@ -724,15 +775,18 @@ def main():
                 if not args.quiet:
                     busy = {"state": "busy", "message": "Another vault check is already running"}
                     print(json.dumps(busy) if args.json else busy["message"])
-                return 0
+                return 1 if args.command == "open" else 0
             with contextlib.suppress(OSError):
                 os.nice(10)
             def timeout_handler(signum, frame):
-                raise Blocked("Vault job exceeded 20 minutes; stopped and will retry")
+                raise Blocked("Launch check exceeded one minute; try again after syncing settles" if args.command == "open"
+                              else "Vault job exceeded 20 minutes; stopped and will retry")
             signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(1200)
+            signal.alarm(60 if args.command == "open" else 1200)
             if args.command == "cleanup":
                 status = {"state": "maintenance", "cleanup": guard.cleanup_lfs_tmp(min_age=60 if args.now else 3600)}
+            elif args.command == "open":
+                status = guard.open_vault(vault=args.vault, deep=args.deep, launch=not args.check_only)
             else:
                 status = guard.run(force=args.now or args.command == "approve", deep=args.deep,
                                    check_only=args.command == "check", accept=args.fingerprint)

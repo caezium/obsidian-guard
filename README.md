@@ -215,9 +215,49 @@ document or attachment is semantically intact. A live vault snapshot is not an
 atomic filesystem snapshot. Confirm restoration periodically and keep an
 independent backup for important data.
 
-Checks do not keep files downloaded, prevent iCloud eviction, or control when
-Obsidian opens. Jobs run only while this Mac is awake and logged in. History is
+Background checks do not keep files downloaded or prevent iCloud eviction.
+Jobs run only while this Mac is awake and logged in. History is
 not pruned automatically, so local disk usage and remote Git/LFS quotas can grow.
+
+## Checked launcher for iCloud vaults
+
+On macOS 15 or later, enable **Keep Downloaded** on the Obsidian folder in
+Finder's iCloud Drive. On iPhone or iPad, enable **Keep Downloaded** on the vault
+folder in Files if that option is available. These are device-specific settings.
+
+```sh
+obsidian-guard open --check-only
+obsidian-guard open
+obsidian-guard open --vault "Another configured vault"
+```
+
+The launcher checks the configured vault root immediately before requesting
+Obsidian to open the selected, already registered vault. It refuses when files
+are cloud-only, missing since the last snapshot, invalid, or changing during the
+check. It hashes and validates changed files; `--deep` also hashes unchanged files.
+It requires an established backup baseline. Intentional deletions must first be
+captured by a normal backup (with review/approval if the backup flags them).
+Generated files listed in `quiet_exclude` can keep changing without blocking it.
+
+Launch checks save `open-status.json` separately, without changing backup status,
+history, or files. A busy backup or a check taking over a minute blocks launch.
+It works offline and does not require an upload before opening your notes.
+
+To create a clickable macOS app using the installed script:
+
+```sh
+python3 install-launcher.py --script ~/.local/bin/obsidian-guard
+```
+
+Pass the actual Python `guard.py` path if your command is a shell wrapper. The
+installer creates `~/Applications/Obsidian Checked.app` and refuses to overwrite
+an existing app. Use that app from Spotlight or add it to the Dock. It uses the
+first configured vault by default and displays an explanation if opening is blocked.
+
+**This is partial protection.** Opening Obsidian directly, a login item, or an
+`obsidian://` link bypasses the launcher. It does not close an already running
+editor, prevent eviction after launch, intercept mobile launches, or prove that
+every document is semantically intact. Keep independent backups enabled.
 
 ## Recovery
 

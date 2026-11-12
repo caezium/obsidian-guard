@@ -118,6 +118,62 @@ class BackupTest(unittest.TestCase):
         self.assertIn('not downloaded', status['message'])
         self.assertEqual((self.guard.home / 'baseline.json').read_bytes(), before)
 
+    def test_checked_open_launches_only_after_validation_without_changing_backup(self):
+        self.run_ok()
+        before = {name: (self.guard.home / name).read_bytes() for name in ['baseline.json', 'status.json', 'backup.index']}
+        with patch.object(self.guard, 'vault_id', return_value='fixture-vault'), patch.object(self.guard, 'command', return_value=(b'', b'', 0)) as command:
+            result = self.guard.open_vault()
+        self.assertEqual(result['state'], 'opened')
+        command.assert_called_once()
+        self.assertEqual(command.call_args.args[0], ['/usr/bin/open', 'obsidian://open?vault=fixture-vault'])
+        for name, content in before.items():
+            self.assertEqual((self.guard.home / name).read_bytes(), content)
+
+    def test_checked_open_blocks_cloud_missing_invalid_and_racing_files(self):
+        self.run_ok()
+        with patch.object(self.guard, 'vault_id', return_value='fixture-vault'), patch.object(self.guard, 'command') as command:
+            with patch.object(self.guard, 'scan', side_effect=Blocked('Cloud-only file')):
+                self.assertEqual(self.guard.open_vault()['state'], 'blocked')
+            note = self.root / 'Notes/hello.md'
+            note.unlink()
+            self.assertEqual(self.guard.open_vault()['state'], 'blocked')
+            note.write_text('Original note\n' * 50)
+            settings = self.root / 'Notes/.obsidian/app.json'
+            settings.write_text('{broken')
+            self.assertEqual(self.guard.open_vault()['state'], 'blocked')
+            settings.write_text('{}')
+            original = self.guard.scan
+            calls = 0
+            def racing():
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    note.write_text('Changing note\n' * 50)
+                return original()
+            with patch.object(self.guard, 'scan', side_effect=racing):
+                self.assertEqual(self.guard.open_vault()['state'], 'blocked')
+            command.assert_not_called()
+
+    def test_checked_open_requires_baseline_and_configured_vault(self):
+        with patch.object(self.guard, 'command') as command:
+            self.assertEqual(self.guard.open_vault()['state'], 'blocked')
+            command.assert_not_called()
+        self.run_ok()
+        with patch.object(self.guard, 'command') as command:
+            self.assertEqual(self.guard.open_vault(vault='elsewhere')['state'], 'blocked')
+            command.assert_not_called()
+
+    def test_checked_open_preview_does_not_launch(self):
+        self.run_ok()
+        with patch.object(self.guard, 'command') as command:
+            self.assertEqual(self.guard.open_vault(launch=False)['state'], 'ready')
+            command.assert_not_called()
+
+    def test_legacy_icloud_placeholder_blocks_backup(self):
+        self.run_ok()
+        (self.root / 'Notes/.pending.md.icloud').write_bytes(b'placeholder')
+        self.assertEqual(self.guard.run()['state'], 'blocked')
+
     def test_empty_note_requires_exact_review_fingerprint(self):
         self.run_ok()
         (self.root / 'Notes/hello.md').write_text('')
