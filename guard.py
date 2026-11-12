@@ -33,6 +33,26 @@ class Blocked(Exception):
     pass
 
 
+def classify_error(stderr):
+    text = stderr.lower()
+    rules = [
+        ("disk_full", (b"no space left", b"disk full", b"not enough space"), "Disk space exhausted; free space before retrying"),
+        ("quota", (b"quota", b"budget", b"data packs", b"bandwidth limit"), "Remote storage or bandwidth quota needs attention"),
+        ("authentication", (b"authentication", b"bad credentials", b"http 401", b"could not read username", b"gh auth login"), "GitHub credentials need attention; check gh auth status"),
+        ("rate_limit", (b"rate limit", b"http 429"), "Remote rate limit reached; will retry later"),
+        ("network", (b"could not resolve", b"timed out", b"timeout", b"network", b"connection", b"tls handshake", b"unexpected eof"), "Network request failed; local history is retained and upload will retry"),
+        ("access", (b"permission denied", b"access denied", b"operation not permitted", b"http 403"), "Access was denied; check filesystem permissions or repository access"),
+        ("index_lock", (b"index.lock", b"another git process"), "Git index could not be locked; check for another Git operation"),
+        ("file_changed", (b"changed as we read", b"changed while", b"short read"), "A file changed while Git was reading it; retry after the edit settles"),
+        ("file_missing", (b"no such file", b"did not match any files", b"unable to stat"), "A file disappeared during staging; retry after syncing settles"),
+        ("remote_rejected", (b"non-fast-forward", b"fetch first", b"rejected"), "The remote rejected the backup; review the remote branch without force-pushing"),
+    ]
+    for category, patterns, message in rules:
+        if any(pattern in text for pattern in patterns):
+            return category, message
+    return "unknown", "Unclassified command failure; see --details for the operation and error fingerprint"
+
+
 def load(path, default=None):
     return json.loads(path.read_text()) if path.exists() else default
 
@@ -93,6 +113,12 @@ def human_time(timestamp, now):
 
 
 def format_status(status, *, details=False, now=None):
+    if status.get("state") == "maintenance":
+        cleanup = status["cleanup"]
+        return ("Obsidian Guard - LFS temporary-file cleanup\n"
+                f"Removed {cleanup['removed_files']} verified redundant files ({human_size(cleanup['removed_bytes'])}).\n"
+                f"Retained {cleanup['retained_files']} files ({human_size(cleanup['retained_bytes'])}); {cleanup['state']}.\n"
+                "Permanent LFS objects and Git history were not pruned.")
     now = time.time() if now is None else now
     state = status.get("state", "not_started")
     labels = {"healthy": "Healthy", "waiting": "Waiting",
@@ -115,6 +141,10 @@ def format_status(status, *, details=False, now=None):
             f" ({human_size(status['bytes'])})" if "bytes" in status else "")))
     if "changed" in status:
         rows.append(("Last scan", f"{status['changed']:,} changed, {status.get('deleted', 0):,} deleted"))
+    if "duration_seconds" in status:
+        rows.append(("Last run", f"{status['duration_seconds']:.1f} seconds"))
+    if status.get("deferred_files"):
+        rows.append(("Deferred", f"{len(status['deferred_files'])} changing generated file(s); previous versions retained"))
     excluded = status.get("credential_exclusions", [])
     if excluded:
         rows.append(("Not backed up", f"{len(excluded):,} credential-containing file{'s' if len(excluded) != 1 else ''}"))
@@ -133,8 +163,20 @@ def format_status(status, *, details=False, now=None):
         if excluded:
             lines += ["", "Credential-containing files excluded from new snapshots:"]
             lines += ["  - " + terminal_text(path) for path in excluded]
+        for error in status.get("diagnostics", []):
+            lines += ["", f"Operation: {terminal_text(error['operation'])}; reason: {error['category']}; "
+                      f"error ID: {error.get('error_id', 'none')}"]
+        notice = status.get("notification", {})
+        if notice:
+            lines += ["", "Last macOS notification request: " + terminal_text(notice.get("result", "unknown")),
+                      "A successful request does not confirm that a banner was displayed or seen."]
     elif excluded:
         lines += ["", "Use --details to see excluded files, or --json for machine-readable output."]
+    if status.get("notification", {}).get("result") == "failed":
+        lines += ["", "macOS notification request failed; check --details and macOS notification settings."]
+    cleanup = status.get("cleanup", {})
+    if cleanup.get("retained_bytes", 0) > 1024**3:
+        lines += ["", f"LFS temporary storage: {human_size(cleanup['retained_bytes'])} retained ({cleanup['state']})."]
     return "\n".join(lines)
 
 
@@ -146,18 +188,24 @@ class Guard:
         self.home = Path(config["state_dir"]).expanduser()
         self.home.mkdir(parents=True, exist_ok=True)
         self.ref = "refs/heads/" + config["backup_branch"]
+        self.diagnostics = []
+        self.deferred_paths = []
+        self.started = time.perf_counter()
+        self.phases = {}
         self.env = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0",
                         GIT_NO_LAZY_FETCH="1", GIT_LITERAL_PATHSPECS="1",
                         GOMAXPROCS="2",
+                        GIT_LFS_PROGRESS=str(self.home / "lfs-progress.log"),
                         PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
 
     def command(self, args, *, data=None, env=None, timeout=120, check=True, label=None):
+        started = time.perf_counter()
         p = subprocess.Popen(args, cwd=self.root, env=env or self.env,
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, start_new_session=True)
         try:
             out, err = p.communicate(data, timeout=timeout)
-        except BaseException:
+        except BaseException as exc:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(p.pid, signal.SIGTERM)
             try:
@@ -166,20 +214,31 @@ class Guard:
                 with contextlib.suppress(ProcessLookupError):
                     os.killpg(p.pid, signal.SIGKILL)
                 p.communicate()
+            if isinstance(exc, subprocess.TimeoutExpired):
+                operation = label or Path(args[0]).name
+                self.diagnostics.append({"operation": operation, "category": "timeout",
+                                         "timeout_seconds": timeout, "duration_seconds": round(time.perf_counter() - started, 3)})
+                raise Blocked(f"{operation} exceeded {timeout} seconds; its child processes were stopped and will retry") from None
             raise
         if check and p.returncode:
             # Never write command output (which may contain user content/tokens)
             # into persistent logs or notification text.
-            detail = "inspect manually"
-            lower = err.lower()
-            if b"quota" in lower or b"budget" in lower:
-                detail = "remote storage/bandwidth quota needs attention"
-            elif b"authentication" in lower or b"permission denied" in lower:
-                detail = "authentication or access needs attention"
-            elif b"could not resolve" in lower or b"timed out" in lower or b"network" in lower:
-                detail = "network unavailable; will retry"
-            raise Blocked(f"{label or Path(args[0]).name} failed (exit {p.returncode}); {detail}")
+            category, detail = classify_error(err)
+            operation = label or Path(args[0]).name
+            error_id = hashlib.sha256(err).hexdigest()[:16]
+            self.diagnostics.append({"operation": operation, "category": category, "exit_code": p.returncode,
+                                     "error_id": error_id, "stderr_bytes": len(err),
+                                     "duration_seconds": round(time.perf_counter() - started, 3)})
+            raise Blocked(f"{operation} failed (exit {p.returncode}, {category}); {detail}")
         return out, err, p.returncode
+
+    @contextlib.contextmanager
+    def phase(self, name):
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.phases[name] = round(self.phases.get(name, 0) + time.perf_counter() - started, 3)
 
     def git(self, *args, data=None, index=None, check=True, timeout=120):
         env = dict(self.env)
@@ -193,6 +252,9 @@ class Guard:
 
     def ignored(self, path):
         return any(fnmatch.fnmatchcase(path, pattern) for pattern in self.c.get("exclude", []))
+
+    def generated(self, path):
+        return any(fnmatch.fnmatchcase(path, pattern) for pattern in self.c.get("quiet_exclude", []))
 
     def scan(self):
         for name in self.c["vaults"]:
@@ -269,16 +331,21 @@ class Guard:
         parent = prior or self.git("rev-parse", "HEAD").decode().strip()
         index = self.home / "backup.index"
         marker = load(self.home / "index-head.json", {})
-        initial = not prior or not index.exists() or marker.get("commit") != parent
-        # A failed/racing staging operation must never be reused as a clean index.
-        with contextlib.suppress(FileNotFoundError):
-            (self.home / "index-head.json").unlink()
-        if initial:
-            # A private index avoids touching the user's staged changes. Snapshot
-            # commits intentionally use plumbing: user commit hooks may edit notes.
-            with contextlib.suppress(FileNotFoundError):
-                index.unlink()
-            self.git("read-tree", parent, index=index)
+        # Keep the last committed index intact. Failed attempts only discard a
+        # disposable copy, preserving stat-cache entries and incremental retries.
+        with tempfile.TemporaryDirectory(prefix="snapshot-", dir=self.home) as folder:
+            attempt = Path(folder) / "index"
+            if index.exists() and marker.get("commit") == parent:
+                shutil.copyfile(index, attempt)
+            else:
+                self.git("read-tree", parent, index=attempt)
+            commit = self.stage_snapshot(attempt, parent, prior, files, baseline, changed, deleted, exclusions)
+            os.replace(attempt, index)
+            atomic_json(self.home / "index-head.json", {"commit": commit})
+            return commit
+
+    def stage_snapshot(self, index, parent, prior, files, baseline, changed, deleted, exclusions):
+        if not prior or baseline.get("commit") != parent:
             paths = set(self.git("ls-files", "--cached", "--others", "--exclude-standard", "-z", index=index).decode().split("\0"))
         else:
             paths = set(changed + deleted)
@@ -309,8 +376,20 @@ class Guard:
                         raise Blocked(f"File exceeds the configured 2 GiB LFS safety limit: {path}")
             self.git("add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul", index=index,
                      data=b"\0".join(os.fsencode(p) for p in sorted(candidates)) + b"\0", timeout=600)
-        if self.scan() != files:
-            raise Blocked("Files changed during the snapshot; retry after editing settles")
+        after = self.scan()
+        raced = {p for p in set(files) | set(after) if files.get(p) != after.get(p)}
+        blocking = [p for p in raced if not self.generated(p) and not self.ignored(p)]
+        if blocking:
+            raise Blocked(f"{len(blocking)} file(s) changed during the snapshot; incremental retry will preserve the previous backup")
+        self.deferred_paths = sorted(p for p in raced if self.generated(p) and not self.ignored(p))
+        if self.deferred_paths:
+            # Keep an earlier complete version of generated state rather than a
+            # possible partial write. New racing paths stay absent until stable.
+            self.git("update-index", "--force-remove", "-z", "--stdin", index=index,
+                     data=b"\0".join(os.fsencode(p) for p in self.deferred_paths) + b"\0")
+            previous = self.git("ls-tree", "-r", "-z", parent, "--", *self.deferred_paths)
+            if previous:
+                self.git("update-index", "-z", "--index-info", index=index, data=previous)
         tree = self.git("write-tree", index=index).decode().strip()
         previous_tree = self.git("rev-parse", parent + "^{tree}").decode().strip()
         if tree != previous_tree:
@@ -319,7 +398,6 @@ class Guard:
         else:
             commit = parent
         self.git("update-ref", self.ref, commit, prior or "0" * 40)
-        atomic_json(self.home / "index-head.json", {"commit": commit})
         return commit
 
     def push(self, commit):
@@ -327,7 +405,7 @@ class Guard:
         if actual != self.c["remote_url"]:
             raise Blocked("Backup remote URL changed; review configuration")
         if repo := self.c.get("github_repo"):
-            out, _, _ = self.command([self.c.get("gh", "/opt/homebrew/bin/gh"), "api", "repos/" + repo, "--jq", ".private"], timeout=30)
+            out, _, _ = self.command([self.c.get("gh", "/opt/homebrew/bin/gh"), "api", "repos/" + repo, "--jq", ".private"], timeout=30, label="GitHub privacy check")
             if out.strip() != b"true":
                 raise Blocked("GitHub backup repository is not private; upload stopped")
         verified = load(self.home / "remote-lfs.json", {})
@@ -368,30 +446,158 @@ class Guard:
                      data=("\n".join(sorted(objects)) + "\n").encode(), timeout=900)
         atomic_json(self.home / "remote-lfs.json", {"verified_at": time.time(), "objects": len(objects), "commit": commit})
 
+    def lfs_busy(self):
+        """Fail closed if Git LFS is running or the temporary directory is open."""
+        try:
+            active = subprocess.run(["/usr/bin/pgrep", "-x", "git-lfs"], capture_output=True, timeout=5)
+            if active.returncode != 1:
+                return True
+            opened = subprocess.run(["/usr/sbin/lsof", "-nP", "+D", str(self.gd / "lfs/tmp")],
+                                    capture_output=True, timeout=10)
+            return opened.returncode != 1 or bool(opened.stdout or opened.stderr)
+        except (OSError, subprocess.TimeoutExpired):
+            return True
+
+    def cleanup_lfs_tmp(self, *, min_age=3600):
+        """Remove only unused, aged, provably redundant LFS scratch data.
+
+        A partial file qualifies only when all its bytes match the beginning of
+        a complete local object whose SHA-256 matches its object ID. Unique,
+        changing, open, recent, and symlinked files are retained.
+        """
+        root = self.gd / "lfs"
+        scratch = root / "tmp"
+        result = {"checked_at": time.time(), "state": "complete", "removed_files": 0,
+                  "removed_bytes": 0, "retained_files": 0, "retained_bytes": 0, "verified_objects": 0,
+                  "removed_sample": []}
+        def finish():
+            if scratch.is_dir() and not scratch.is_symlink():
+                for path in scratch.iterdir():
+                    with contextlib.suppress(FileNotFoundError):
+                        info = path.lstat()
+                        if stat.S_ISREG(info.st_mode):
+                            result["retained_files"] += 1
+                            result["retained_bytes"] += info.st_size
+            atomic_json(self.home / "lfs-cleanup.json", result)
+            return result
+        if not scratch.exists():
+            return finish()
+        if scratch.is_symlink() or root.is_symlink():
+            result["state"] = "unsupported symlinked storage"
+            return finish()
+        now = time.time()
+        pending = []
+        for path in scratch.iterdir():
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode) and now - max(info.st_mtime, info.st_ctime) >= min_age:
+                pending.append((path, info))
+        if not pending:
+            return finish()
+        if self.lfs_busy():
+            result["state"] = "busy"
+            return finish()
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        objects = []
+        for path in (root / "objects").glob("*/*/*"):
+            if (re.fullmatch(r"[0-9a-f]{64}", path.name) and path.is_file() and not path.is_symlink()
+                    and not path.parent.is_symlink() and not path.parent.parent.is_symlink()):
+                objects.append((path, path.stat()))
+        prefixes, verified = {}, {}
+        for path, before in pending:
+            with contextlib.suppress(FileNotFoundError):
+                if identity(path.lstat()) != identity(before):
+                    continue
+                redundant = before.st_size == 0
+                if not redundant:
+                    length = min(512, before.st_size)
+                    if length not in prefixes:
+                        table = {}
+                        for obj, info in objects:
+                            if info.st_size >= length:
+                                with obj.open("rb") as f:
+                                    key = hashlib.sha256(f.read(length)).digest()
+                                table.setdefault(key, []).append((obj, info))
+                        prefixes[length] = table
+                    with path.open("rb") as f:
+                        key = hashlib.sha256(f.read(length)).digest()
+                    for obj, info in prefixes[length].get(key, []):
+                        if info.st_size < before.st_size or identity(obj.stat()) != identity(info):
+                            continue
+                        if obj not in verified:
+                            verified[obj] = digest(obj) == obj.name and identity(obj.stat()) == identity(info)
+                        if not verified[obj]:
+                            continue
+                        with path.open("rb") as partial, obj.open("rb") as full:
+                            remaining = before.st_size
+                            while remaining:
+                                chunk = partial.read(min(1024 * 1024, remaining))
+                                if not chunk or chunk != full.read(len(chunk)):
+                                    break
+                                remaining -= len(chunk)
+                            redundant = remaining == 0 and identity(obj.stat()) == identity(info)
+                        if redundant:
+                            break
+                if redundant and identity(path.lstat()) == identity(before):
+                    if self.lfs_busy():
+                        result["state"] = "busy"
+                        break
+                    if identity(path.lstat()) != identity(before):
+                        continue
+                    path.unlink()
+                    result["removed_files"] += 1
+                    result["removed_bytes"] += before.st_size
+                    if len(result["removed_sample"]) < 50:
+                        result["removed_sample"].append({"temporary_file": path.name, "bytes": before.st_size,
+                                                         "verified_object": obj.name if before.st_size else None})
+        result["verified_objects"] = sum(verified.values())
+        return finish()
+
     def report(self, status):
         before = load(self.home / "status.json", {})
+        status.update(completed_at=time.time(), duration_seconds=round(time.perf_counter() - self.started, 3),
+                      phases=self.phases, diagnostics=self.diagnostics)
+        alert = status["state"] in {"blocked", "error"}
+        last = load(self.home / "notification.json", {})
+        recovered = status["state"] == "healthy" and (
+            before.get("state") in {"blocked", "error"} or last.get("event_state") in {"blocked", "error"})
+        key = status["state"] + status["message"]
+        interval = 21600 if last.get("result") == "accepted" else 300
+        if self.c.get("notifications", True) and (alert or recovered) and (last.get("key") != key or time.time() - last.get("time", 0) >= interval):
+            script = 'on run argv\n display notification (item 1 of argv) with title "Obsidian Guard"\nend run'
+            notice = {"key": key, "time": time.time(), "event_state": status["state"],
+                      "result": "failed", "delivery_confirmed": False}
+            try:
+                result = subprocess.run(["/usr/bin/osascript", "-e", script, status["message"][:240]], capture_output=True, timeout=10)
+                notice.update(exit_code=result.returncode, result="accepted" if result.returncode == 0 else "failed")
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                notice["error_type"] = type(exc).__name__
+            # An accepted AppleScript request cannot prove a banner was shown.
+            atomic_json(self.home / "notification.json", notice)
+            last = notice
+        if last:
+            status["notification"] = last
         atomic_json(self.home / "status.json", status)
+        records = [("runs", 10 * 1024 * 1024)]
         if (before.get("state"), before.get("message")) != (status["state"], status["message"]):
-            log = self.home / "events.jsonl"
-            if log.exists() and log.stat().st_size > 1024 * 1024:
-                os.replace(log, self.home / "events.previous.jsonl")
+            records.append(("events", 1024 * 1024))
+        for name, limit in records:
+            log = self.home / (name + ".jsonl")
+            if log.exists() and log.stat().st_size > limit:
+                os.replace(log, self.home / (name + ".previous.jsonl"))
             with log.open("a") as f:
                 f.write(json.dumps(status, ensure_ascii=False) + "\n")
-        alert = status["state"] in {"blocked", "error"}
-        recovered = status["state"] == "healthy" and before.get("state") in {"blocked", "error"}
-        last = load(self.home / "notification.json", {})
-        key = status["state"] + status["message"]
-        if self.c.get("notifications", True) and (alert or recovered) and (last.get("key") != key or time.time() - last.get("time", 0) > 21600):
-            script = 'on run argv\n display notification (item 1 of argv) with title "Obsidian Guard"\nend run'
-            # The OS controls whether banners are displayed; status/logs remain
-            # available even if notification permission is disabled.
-            subprocess.run(["/usr/bin/osascript", "-e", script, status["message"][:240]], capture_output=True, timeout=10)
-            atomic_json(self.home / "notification.json", {"key": key, "time": time.time()})
 
     def run(self, *, force=False, deep=False, check_only=False, accept=None):
+        self.started = time.perf_counter()
+        self.diagnostics = []
+        self.deferred_paths = []
+        self.phases = {}
         now = time.time()
+        progress = self.home / "lfs-progress.log"
+        if progress.exists() and progress.stat().st_size > 1024 * 1024:
+            os.replace(progress, self.home / "lfs-progress.previous.log")
         baseline = load(self.home / "baseline.json", {})
-        status = {"checked_at": now, "last_snapshot_at": baseline.get("snapshot_at"),
+        status = {"started_at": now, "checked_at": now, "last_snapshot_at": baseline.get("snapshot_at"),
                   "last_push_at": baseline.get("pushed_at"), "commit": baseline.get("commit")}
         try:
             push_error = None
@@ -399,7 +605,8 @@ class Guard:
             # vault is being edited. Offline uploads must not stop local history.
             if not check_only and self.c.get("push", True) and baseline.get("commit") and baseline.get("pushed_commit") != baseline["commit"]:
                 try:
-                    self.push(baseline["commit"])
+                    with self.phase("upload"):
+                        self.push(baseline["commit"])
                     baseline.update(pushed_commit=baseline["commit"], pushed_at=time.time())
                     atomic_json(self.home / "baseline.json", baseline)
                     status["last_push_at"] = baseline["pushed_at"]
@@ -407,9 +614,11 @@ class Guard:
                     push_error = e
             now = time.time()
             status["checked_at"] = now
-            files = self.scan()
+            with self.phase("scan"):
+                files = self.scan()
             deep = deep or now - baseline.get("deep_at", 0) > self.c.get("deep_interval", 604800)
-            changed, deleted, hashes, excluded, anomalies, problems, fingerprint = self.evaluate(files, baseline, deep)
+            with self.phase("validation"):
+                changed, deleted, hashes, excluded, anomalies, problems, fingerprint = self.evaluate(files, baseline, deep)
             status.update(files=len(files), bytes=sum(v[0] for v in files.values()), changed=len(changed),
                           deleted=len(deleted), credential_exclusions=excluded, fingerprint=fingerprint,
                           anomalies=anomalies[:50], problems=problems[:50])
@@ -418,8 +627,12 @@ class Guard:
             if anomalies and accept != fingerprint:
                 raise Blocked(anomalies[0] + "; review status and approve this fingerprint if intentional")
             free = shutil.disk_usage(self.gd).free
+            if not check_only and free < self.c.get("minimum_free_bytes", 3 * 1024**3):
+                with self.phase("maintenance"):
+                    status["cleanup"] = self.cleanup_lfs_tmp()
+                free = shutil.disk_usage(self.gd).free
             if free < self.c.get("minimum_free_bytes", 3 * 1024**3):
-                raise Blocked("Less than 3 GiB disk space available; backup paused")
+                raise Blocked("Insufficient free disk space; backup paused. Review LFS cleanup status and free space before retrying")
             latest = max((files[p][1] / 1e9 for p in changed if not self.ignored(p)
                           and not any(fnmatch.fnmatchcase(p, pattern)
                                       for pattern in self.c.get("quiet_exclude", []))), default=0)
@@ -434,20 +647,44 @@ class Guard:
                   and not deep and (not self.c.get("push", True) or baseline.get("pushed_commit") == baseline.get("commit"))):
                 status.update(state="healthy", message="Vault is downloaded; next snapshot not due yet")
             else:
-                commit = self.snapshot(files, baseline, changed, deleted, excluded)
+                with self.phase("snapshot"):
+                    commit = self.snapshot(files, baseline, changed, deleted, excluded)
+                # A generated file that raced retained its parent's Git entry.
+                # Keep the matching baseline too so a later run retries it.
+                for path in self.deferred_paths:
+                    if path in baseline.get("files", {}):
+                        files[path] = baseline["files"][path]
+                        if path in baseline.get("hashes", {}):
+                            hashes[path] = baseline["hashes"][path]
+                        else:
+                            hashes.pop(path, None)
+                    else:
+                        files.pop(path, None)
+                        hashes.pop(path, None)
+                status["deferred_files"] = self.deferred_paths
                 baseline.update(files=files, hashes=hashes, credential_exclusions=excluded, commit=commit, snapshot_at=now)
                 if deep:
                     baseline["deep_at"] = now
                 atomic_json(self.home / "baseline.json", baseline)
                 status.update(commit=commit, last_snapshot_at=now)
                 if not push_error and self.c.get("push", True) and (baseline.get("pushed_commit") != commit or now - baseline.get("pushed_at", 0) > 86400):
-                    self.push(commit)
+                    with self.phase("upload"):
+                        self.push(commit)
                     baseline.update(pushed_commit=commit, pushed_at=time.time())
                     atomic_json(self.home / "baseline.json", baseline)
                 message = "Vault is downloaded; backup is current" if self.c.get("push", True) else "Local snapshot saved; upload not requested"
                 status.update(last_push_at=baseline.get("pushed_at"), state="healthy", message=message)
             if push_error:
                 raise Blocked(f"Local history retained; remote backup failed: {push_error}")
+            if not check_only:
+                cleanup = load(self.home / "lfs-cleanup.json", {})
+                if now - cleanup.get("checked_at", 0) >= 86400:
+                    try:
+                        with self.phase("maintenance"):
+                            cleanup = self.cleanup_lfs_tmp()
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        cleanup = {"state": "failed", "error_type": type(exc).__name__}
+                status["cleanup"] = cleanup
             self.report(status)
         except (Blocked, OSError, subprocess.TimeoutExpired, ValueError) as e:
             status.update(state="blocked" if isinstance(e, Blocked) else "error", message=str(e))
@@ -458,7 +695,7 @@ class Guard:
 def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=["run", "check", "status", "approve"])
+    parser.add_argument("command", choices=["run", "check", "status", "approve", "cleanup"])
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--deep", action="store_true")
     parser.add_argument("--now", action="store_true")
@@ -476,7 +713,7 @@ def main():
         guard.c["push"] = False
     if args.command == "status":
         status = load(guard.home / "status.json", {"state": "not_started"})
-        status["stale"] = time.time() - status.get("checked_at", 0) > 900
+        status["stale"] = time.time() - status.get("completed_at", status.get("checked_at", 0)) > 900
     else:
         if args.command == "approve" and not args.fingerprint:
             parser.error("approve requires --fingerprint from a reviewed status")
@@ -494,8 +731,11 @@ def main():
                 raise Blocked("Vault job exceeded 20 minutes; stopped and will retry")
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(1200)
-            status = guard.run(force=args.now or args.command == "approve", deep=args.deep,
-                               check_only=args.command == "check", accept=args.fingerprint)
+            if args.command == "cleanup":
+                status = {"state": "maintenance", "cleanup": guard.cleanup_lfs_tmp(min_age=60 if args.now else 3600)}
+            else:
+                status = guard.run(force=args.now or args.command == "approve", deep=args.deep,
+                                   check_only=args.command == "check", accept=args.fingerprint)
             signal.alarm(0)
     if not args.quiet:
         print(json.dumps(status, ensure_ascii=False, indent=2) if args.json

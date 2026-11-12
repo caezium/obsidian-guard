@@ -15,6 +15,9 @@ remote-lfs.json
 backup.index*
 index-head.json
 run.lock
+lfs-cleanup.json
+runs*.jsonl
+snapshot-*/
 *.log
 *.plist
 *-verification.json

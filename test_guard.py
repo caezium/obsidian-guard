@@ -192,6 +192,186 @@ class BackupTest(unittest.TestCase):
         state = self.run_ok()
         self.assertNotIn('transient.md', self.git('ls-tree', '-r', '--name-only', state['commit']))
 
+    def test_retry_does_not_stage_unchanged_files(self):
+        self.run_ok()
+        note = self.root / 'Notes/hello.md'
+        note.write_text('Edited note\n' * 50)
+        original_scan = self.guard.scan
+        calls = 0
+        def race():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                note.write_text('Edited again\n' * 50)
+            return original_scan()
+        with patch.object(self.guard, 'scan', race):
+            self.assertEqual(self.guard.run()['state'], 'blocked')
+        original_git = self.guard.git
+        staged = []
+        def capture(*args, **kwargs):
+            if args[0] == 'add':
+                staged.extend(kwargs['data'].decode().strip('\0').split('\0'))
+            return original_git(*args, **kwargs)
+        with patch.object(self.guard, 'git', capture):
+            self.run_ok()
+        self.assertEqual(staged, ['Notes/hello.md'])
+
+    def test_missing_index_reuses_committed_baseline_without_full_staging(self):
+        self.run_ok()
+        (self.guard.home / 'backup.index').unlink()
+        (self.guard.home / 'index-head.json').unlink()
+        (self.root / 'Notes/hello.md').write_text('Edited note\n' * 50)
+        original_git = self.guard.git
+        staged = []
+        def capture(*args, **kwargs):
+            if args[0] == 'add':
+                staged.extend(kwargs['data'].decode().strip('\0').split('\0'))
+            return original_git(*args, **kwargs)
+        with patch.object(self.guard, 'git', capture):
+            self.run_ok()
+        self.assertEqual(staged, ['Notes/hello.md'])
+
+    def test_racing_heartbeat_keeps_previous_version_without_blocking_notes(self):
+        heartbeat = self.root / 'Notes/heartbeat.md'
+        heartbeat.write_text('beat 0')
+        self.config['quiet_exclude'] = ['Notes/heartbeat.md']
+        self.run_ok()
+        heartbeat.write_text('beat 1')
+        (self.root / 'Notes/hello.md').write_text('Edited note\n' * 50)
+        original_scan = self.guard.scan
+        calls = 0
+        def race():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                heartbeat.write_text('beat 2')
+            return original_scan()
+        with patch.object(self.guard, 'scan', race):
+            status = self.run_ok()
+        self.assertEqual(self.git('show', status['commit'] + ':Notes/heartbeat.md'), 'beat 0')
+        self.assertEqual(self.git('show', status['commit'] + ':Notes/hello.md'), 'Edited note\n' * 50)
+        status = self.run_ok()
+        self.assertEqual(self.git('show', status['commit'] + ':Notes/heartbeat.md'), 'beat 2')
+
+    def test_errors_are_classified_without_recording_secret_stderr(self):
+        with self.assertRaises(Blocked) as caught:
+            self.guard.command([sys.executable, '-c',
+                                'import sys; sys.stderr.write("fatal: No space left on device; private-value"); sys.exit(1)'],
+                               label='git add')
+        self.assertIn('disk', str(caught.exception).lower())
+        self.assertNotIn('private-value', str(caught.exception))
+        self.assertEqual(self.guard.diagnostics[-1]['category'], 'disk_full')
+        self.assertNotIn('private-value', json.dumps(self.guard.diagnostics))
+
+    def test_notification_failure_does_not_break_backup_and_is_recorded(self):
+        self.config['notifications'] = True
+        with patch('guard.subprocess.run', return_value=types.SimpleNamespace(returncode=1)):
+            self.guard.report({'state': 'blocked', 'message': 'Test warning', 'checked_at': 1000})
+        notice = load(self.guard.home / 'notification.json')
+        self.assertEqual(notice['result'], 'failed')
+        self.assertEqual(load(self.guard.home / 'status.json')['notification']['result'], 'failed')
+        self.config['notifications'] = False
+        status = self.run_ok()
+        self.assertIn('completed_at', status)
+        self.assertIn('duration_seconds', status)
+
+    def test_lfs_cleanup_removes_only_verified_unused_duplicate_data(self):
+        content = b'complete attachment content' * 100
+        oid = hashlib.sha256(content).hexdigest()
+        obj = self.guard.gd / 'lfs/objects' / oid[:2] / oid[2:4] / oid
+        obj.parent.mkdir(parents=True)
+        obj.write_bytes(content)
+        scratch = self.guard.gd / 'lfs/tmp'
+        scratch.mkdir()
+        (scratch / 'partial').write_bytes(content[:600])
+        (scratch / 'complete').write_bytes(content)
+        (scratch / 'unique').write_bytes(b'keep unique data')
+        (scratch / 'empty').write_bytes(b'')
+        (scratch / 'link').symlink_to(obj)
+        with patch.object(self.guard, 'lfs_busy', return_value=False):
+            result = self.guard.cleanup_lfs_tmp(min_age=0)
+        self.assertEqual(result['removed_files'], 3)
+        self.assertFalse((scratch / 'partial').exists())
+        self.assertFalse((scratch / 'complete').exists())
+        self.assertTrue((scratch / 'unique').exists())
+        self.assertTrue((scratch / 'link').is_symlink())
+        self.assertEqual(obj.read_bytes(), content)
+
+    def test_lfs_cleanup_preserves_recent_busy_and_unverified_files(self):
+        scratch = self.guard.gd / 'lfs/tmp'
+        scratch.mkdir(parents=True)
+        p = scratch / 'recent'; p.write_bytes(b'')
+        with patch.object(self.guard, 'lfs_busy', return_value=False):
+            self.assertEqual(self.guard.cleanup_lfs_tmp()['removed_files'], 0)
+        with patch.object(self.guard, 'lfs_busy', return_value=True):
+            result = self.guard.cleanup_lfs_tmp(min_age=0)
+        self.assertEqual(result['state'], 'busy')
+        self.assertTrue(p.exists())
+
+    def test_lfs_cleanup_will_not_trust_a_corrupted_object(self):
+        expected = b'original attachment' * 100
+        corrupt = b'corrupted content!!' * 100
+        oid = hashlib.sha256(expected).hexdigest()
+        obj = self.guard.gd / 'lfs/objects' / oid[:2] / oid[2:4] / oid
+        obj.parent.mkdir(parents=True); obj.write_bytes(corrupt)
+        scratch = self.guard.gd / 'lfs/tmp'; scratch.mkdir()
+        p = scratch / 'partial'; p.write_bytes(corrupt[:600])
+        with patch.object(self.guard, 'lfs_busy', return_value=False):
+            result = self.guard.cleanup_lfs_tmp(min_age=0)
+        self.assertEqual(result['removed_files'], 0)
+        self.assertTrue(p.exists())
+
+    def test_lfs_cleanup_keeps_file_changed_during_final_busy_check(self):
+        scratch = self.guard.gd / 'lfs/tmp'; scratch.mkdir(parents=True)
+        p = scratch / 'changing'; p.write_bytes(b'')
+        calls = 0
+        def busy():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                p.write_bytes(b'new bytes')
+            return False
+        with patch.object(self.guard, 'lfs_busy', side_effect=busy):
+            result = self.guard.cleanup_lfs_tmp(min_age=0)
+        self.assertEqual(result['removed_files'], 0)
+        self.assertEqual(p.read_bytes(), b'new bytes')
+
+    def test_notification_timeout_is_recorded_without_raising(self):
+        self.config['notifications'] = True
+        with patch('guard.subprocess.run', side_effect=subprocess.TimeoutExpired('osascript', 10)):
+            self.guard.report({'state': 'blocked', 'message': 'Test warning', 'checked_at': 1000})
+        self.assertEqual(load(self.guard.home / 'notification.json')['error_type'], 'TimeoutExpired')
+        self.assertEqual(load(self.guard.home / 'status.json')['state'], 'blocked')
+
+    def test_command_timeout_records_operation_and_stops_children(self):
+        with self.assertRaises(Blocked):
+            self.guard.command([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=.05, label='test operation')
+        self.assertEqual(self.guard.diagnostics[-1]['category'], 'timeout')
+        self.assertEqual(self.guard.diagnostics[-1]['operation'], 'test operation')
+
+    def test_failed_candidate_does_not_modify_committed_private_index(self):
+        self.run_ok()
+        before = (self.guard.home / 'backup.index').read_bytes()
+        (self.root / 'Notes/new.md').write_text('New note')
+        original = self.guard.git
+        def fail(*args, **kwargs):
+            value = original(*args, **kwargs)
+            if args[0] == 'add':
+                raise Blocked('Interrupted after staging')
+            return value
+        with patch.object(self.guard, 'git', fail):
+            self.assertEqual(self.guard.run()['state'], 'blocked')
+        self.assertEqual((self.guard.home / 'backup.index').read_bytes(), before)
+        self.assertEqual(list(self.guard.home.glob('snapshot-*')), [])
+        self.run_ok()
+
+    def test_low_disk_attempts_verified_scratch_cleanup_before_pausing(self):
+        self.config['minimum_free_bytes'] = 1000
+        space = [types.SimpleNamespace(free=0), types.SimpleNamespace(free=2000)]
+        with patch('guard.shutil.disk_usage', side_effect=space), patch.object(self.guard, 'cleanup_lfs_tmp', wraps=self.guard.cleanup_lfs_tmp) as cleanup:
+            self.run_ok()
+            cleanup.assert_called_once()
+
     def test_failed_push_is_retried_and_never_reported_healthy(self):
         self.config.update(push=True, snapshot_interval=900)
         with patch.object(self.guard, 'push', side_effect=Blocked('offline')) as push:

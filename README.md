@@ -28,6 +28,8 @@ does not scan the vault again. An old result is clearly marked as overdue.
   without recent edits. Changed files are hashed; a full checksum scan runs weekly.
 - A private Git index and a dedicated backup branch leave the worktree, HEAD,
   normal staging area, and other local branches alone.
+  Each attempt stages into a disposable copy of the committed index. A failed
+  attempt preserves that index, so its retry stays incremental.
 - One job runs at a time, with background priority, one Git packing thread and
   one LFS transfer. There are no full-vault archives or automatic Git pruning.
 - Private GitHub uploads are verified by comparing the remote commit. Current
@@ -134,6 +136,10 @@ launchctl bootout "gui/$(id -u)/local.obsidian-guard"
 To restart it, bootstrap `~/Library/LaunchAgents/local.obsidian-guard.plist` again.
 macOS controls notification permissions and banners. Status and event logs remain
 available even if notifications are disabled.
+`status --details` reports whether the last AppleScript notification request was
+accepted or failed. Acceptance cannot prove that macOS displayed a banner or that
+someone saw it. Failed requests retry on a later check rather than suppressing
+alerts for six hours. Notification failures do not change the backup result.
 
 ## When a backup pauses
 
@@ -157,8 +163,42 @@ and uploads nothing, although it updates local status and logs.
 
 If a plugin constantly rewrites a generated heartbeat file, its relative path can
 go in `quiet_exclude`. Such files remain checked and backed up; their timestamps
-do not restart the editing quiet period. `exclude` instead omits matching files
+do not restart the editing quiet period. If one changes during staging, that
+snapshot retains its previous complete version and retries the generated file
+later, without postponing other notes. Use this only for regenerable plugin
+state, not ordinary notes. `exclude` instead omits matching files
 from new snapshots. Both lists use Python `fnmatch` patterns.
+
+## Diagnostics and temporary storage
+
+`status --details` includes failed operations, error categories and stable error
+fingerprints. Disk, authentication, network, access, lock, quota and timeout
+failures have specific guidance. Arbitrary command stderr is not persisted,
+because it can contain note contents or credentials; an unknown classification
+still requires manual investigation.
+
+Every completed job is recorded in `runs.jsonl` with start/completion times,
+duration and phase timings. That log rotates at 10 MB and keeps one previous file.
+`events.jsonl` continues to record state transitions. Local `lfs-progress.log`
+records LFS activity from this job, including filenames, and rotates at 1 MB
+between runs. These files are private diagnostic data, not files to publish.
+
+Once a day, and before pausing for low disk space, the job checks unused LFS
+temporary files older than an hour. It
+removes only empty files or complete/partial copies of a local LFS object whose
+full SHA-256 has been verified. Every byte of a partial copy must match the
+complete object's prefix. Active, changing, recent, symlinked or unmatched files
+are kept. Permanent LFS objects and Git history are never pruned.
+
+```sh
+obsidian-guard cleanup
+obsidian-guard cleanup --now
+```
+
+The explicit `--now` cleanup lowers the age threshold to one minute; all other
+verification and active-process checks still apply. Cleanup refuses to proceed
+while Git LFS is running or the temporary directory has open files. Its result
+is saved in `lfs-cleanup.json` without replacing the last backup status.
 
 ## Coverage and limits
 
